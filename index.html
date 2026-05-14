@@ -424,15 +424,65 @@
         </div>
     </div>
     
-    <script>
-        let ws = null;
-        let currentUser = null;
-        let currentChat = null;
-        let currentChatType = null;
-        let currentGroupId = null;
-        let onlineUsers = [];
-        let userGroups = [];
-        let mobileView = window.innerWidth <= 768;
+<script>
+    let ws = null;
+    let currentUser = null;
+    let currentChat = null;
+    let currentChatType = null;
+    let currentGroupId = null;
+    let onlineUsers = [];
+    let userGroups = [];
+    let mobileView = window.innerWidth <= 768;
+    let reconnectAttempts = 0;
+    
+    // ========== WEBSOCKET С ПЕРЕПОДКЛЮЧЕНИЕМ ==========
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/${currentUser}`;
+        
+        console.log("🔄 Подключение к WebSocket:", wsUrl);
+        ws = new WebSocket(wsUrl);
+        
+        ws.onopen = () => {
+            console.log("✅ WebSocket подключен!");
+            reconnectAttempts = 0;
+        };
+        
+        ws.onmessage = (event) => {
+            console.log("📩 Получено сообщение:", event.data);
+            try {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'user_list') {
+                    onlineUsers = data.users;
+                    renderSidebar();
+                }
+                else if (data.type === 'private') {
+                    if (currentChatType === 'private' && currentChat === data.from) {
+                        addMessage(data.from, data.message, data.time, false);
+                    }
+                    // Обновляем список, чтобы показать нового пользователя
+                    renderSidebar();
+                }
+                else if (data.type === 'group') {
+                    if (currentChatType === 'group' && currentGroupId === data.group_id) {
+                        addMessage(data.from, data.message, data.time, data.is_own);
+                    }
+                }
+            } catch(e) {
+                console.error("Ошибка парсинга:", e);
+            }
+        };
+        
+        ws.onerror = (error) => {
+            console.error("❌ WebSocket ошибка:", error);
+        };
+        
+        ws.onclose = () => {
+            console.log("🔌 WebSocket закрыт. Переподключение через 3 секунды...");
+            setTimeout(connectWebSocket, 3000);
+        };
+    }
         
         // ========== МЕНЮ ==========
         function toggleMenu() {
@@ -604,32 +654,7 @@
                 alert('Неверное имя пользователя или пароль');
             }
         }
-        
-        // ========== WEBSOCKET ==========
-        function connectWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws/${currentUser}`);
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'user_list') {
-                    onlineUsers = data.users;
-                    renderSidebar();
-                } else if (data.type === 'private') {
-                    if (currentChatType === 'private' && currentChat === data.from) {
-                        addMessage(data.from, data.message, data.time, false);
-                    }
-                    renderSidebar(true);
-                } else if (data.type === 'group') {
-                    if (currentChatType === 'group' && currentGroupId === data.group_id) {
-                        addMessage(data.from, data.message, data.time, data.is_own);
-                    }
-                    renderSidebar(true);
-                }
-            };
-            ws.onclose = () => setTimeout(connectWebSocket, 3000);
-        }
-        
+
         // ========== ЧАТЫ ==========
         async function loadUserGroups() {
             const response = await fetch(`/group/list/${currentUser}`);
@@ -748,82 +773,71 @@
         }
         
         function sendMessage() {
-            const input = document.getElementById('messageInput');
-            const message = input.value.trim();
-            if (!message) return;
-            
-            if (currentChatType === 'private' && currentChat) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'private', to: currentChat, message }));
-                    input.value = '';
-                    addMessage(currentUser, message, new Date().toLocaleTimeString(), true);
-                }
-            } else if (currentChatType === 'group' && currentGroupId) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'group', group_id: currentGroupId, message }));
-                    input.value = '';
-                }
-            } else {
-                alert('Сначала выберите чат');
-            }
+        const input = document.getElementById('messageInput');
+        const message = input.value.trim();
+        if (!message) {
+            console.log("Пустое сообщение");
+            return;
         }
         
-        function handleKeyPress(e) { if (e.key === 'Enter') sendMessage(); }
-        
-        // ========== ГРУППЫ ==========
-        function showCreateGroupModal() {
-            closeMenu();
-            document.getElementById('createGroupModal').style.display = 'flex';
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            alert("Нет соединения с сервером. Попробуйте обновить страницу.");
+            console.log("WebSocket состояние:", ws ? ws.readyState : "null");
+            return;
         }
         
-        async function createGroup() {
-            const name = document.getElementById('groupName').value;
-            const description = document.getElementById('groupDesc').value;
-            const response = await fetch('/group/create', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, description, created_by: currentUser })
-            });
-            if (response.ok) {
-                alert('Группа создана!');
-                closeModal('createGroupModal');
-                await loadUserGroups();
-                document.getElementById('groupName').value = '';
-                document.getElementById('groupDesc').value = '';
-            } else {
-                alert('Ошибка при создании');
-            }
+        if (currentChatType === 'private' && currentChat) {
+            const msgData = {
+                type: 'private',
+                to: currentChat,
+                message: message
+            };
+            console.log("📤 Отправка личного сообщения:", msgData);
+            ws.send(JSON.stringify(msgData));
+            input.value = '';
+            addMessage(currentUser, message, new Date().toLocaleTimeString(), true);
+        } 
+        else if (currentChatType === 'group' && currentGroupId) {
+            const msgData = {
+                type: 'group',
+                group_id: currentGroupId,
+                message: message
+            };
+            console.log("📤 Отправка группового сообщения:", msgData);
+            ws.send(JSON.stringify(msgData));
+            input.value = '';
+        } else {
+            alert("Сначала выберите чат");
         }
+    }
+    
+    // Убедитесь, что после логина вызывается connectWebSocket()
+    async function login() {
+        const username = document.getElementById('loginUsername').value;
+        const password = document.getElementById('loginPassword').value;
         
-        function closeModal(modalId) {
-            document.getElementById(modalId).style.display = 'none';
-        }
+        console.log("Попытка входа:", username);
         
-        function logout() {
-            if (confirm('Выйти из аккаунта?')) {
-                if (ws) ws.close();
-                currentUser = null;
-                document.getElementById('authContainer').style.display = 'flex';
-                document.getElementById('chatContainer').style.display = 'none';
-                showLogin();
-            }
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        
-        window.addEventListener('resize', () => {
-            mobileView = window.innerWidth <= 768;
-            if (!mobileView) {
-                document.getElementById('chatArea').classList.remove('active-mobile');
-                document.getElementById('backBtn').style.display = 'none';
-            }
+        const response = await fetch('/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
         });
         
-        showLogin();
-    </script>
+        if (response.ok) {
+            const data = await response.json();
+            currentUser = data.username;
+            console.log("Вход выполнен, подключаем WebSocket...");
+            connectWebSocket();  // <--- ЭТО САМОЕ ВАЖНОЕ
+            document.getElementById('authContainer').style.display = 'none';
+            document.getElementById('chatContainer').style.display = 'flex';
+            await updateMenuInfo();
+            await loadUserGroups();
+            renderSidebar();
+        } else {
+            alert('Неверное имя пользователя или пароль');
+        }
+    }
+</script>
 </body>
 </html>
