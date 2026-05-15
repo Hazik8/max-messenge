@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
@@ -9,11 +9,12 @@ import os
 import base64
 from datetime import datetime
 from typing import Dict, List
+import asyncio
 import uvicorn
 
 app = FastAPI()
 
-# ВАЖНО: Настройка CORS для WebSocket
+# Разрешаем всё для CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,14 +23,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Создаём папку для аватаров
-os.makedirs("avatars", exist_ok=True)
-
-# ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
+# Инициализация БД
 def init_db():
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     
+    # Пользователи
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -38,11 +37,10 @@ def init_db():
         bio TEXT DEFAULT '',
         status TEXT DEFAULT 'offline',
         last_seen TIMESTAMP,
-        created_at TIMESTAMP,
-        phone TEXT DEFAULT '',
-        email TEXT DEFAULT ''
+        created_at TIMESTAMP
     )''')
     
+    # Личные сообщения
     c.execute('''CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         from_user TEXT NOT NULL,
@@ -52,15 +50,16 @@ def init_db():
         is_read BOOLEAN DEFAULT 0
     )''')
     
+    # Группы
     c.execute('''CREATE TABLE IF NOT EXISTS groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         description TEXT DEFAULT '',
-        avatar TEXT DEFAULT '',
         created_by TEXT NOT NULL,
         created_at TIMESTAMP
     )''')
     
+    # Участники групп
     c.execute('''CREATE TABLE IF NOT EXISTS group_members (
         group_id INTEGER,
         username TEXT NOT NULL,
@@ -69,6 +68,7 @@ def init_db():
         UNIQUE(group_id, username)
     )''')
     
+    # Сообщения в группах
     c.execute('''CREATE TABLE IF NOT EXISTS group_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         group_id INTEGER NOT NULL,
@@ -77,18 +77,18 @@ def init_db():
         timestamp TIMESTAMP
     )''')
     
-    # Добавляем тестового пользователя
+    # Тестовый пользователь
     test_password = hashlib.sha256("test123".encode()).hexdigest()
     c.execute("INSERT OR IGNORE INTO users (username, password, bio, created_at, status) VALUES (?, ?, ?, ?, ?)",
-              ("testuser", test_password, "Это тестовый аккаунт! Пишите мне 😊", datetime.now().isoformat(), "offline"))
+              ("testuser", test_password, "🔥 Тестовый аккаунт! Напишите мне", datetime.now().isoformat(), "offline"))
     
     conn.commit()
     conn.close()
-    print("✅ База данных инициализирована")
+    print("✅ База данных готова")
 
 init_db()
 
-# ========== УПРАВЛЕНИЕ WEBSOCKET ==========
+# Управление WebSocket
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -97,7 +97,6 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[username] = websocket
         
-        # Обновляем статус в БД
         conn = sqlite3.connect('messenger.db')
         c = conn.cursor()
         c.execute("UPDATE users SET status='online', last_seen=? WHERE username=?", 
@@ -105,41 +104,37 @@ class ConnectionManager:
         conn.commit()
         conn.close()
         
-        print(f"✅ {username} подключился. Онлайн: {len(self.active_connections)}")
-        await self.broadcast_user_list()
+        print(f"✅ {username} онлайн")
+        await self.broadcast_users()
     
     def disconnect(self, username: str):
         if username in self.active_connections:
             del self.active_connections[username]
-            
-            # Обновляем статус
             conn = sqlite3.connect('messenger.db')
             c = conn.cursor()
             c.execute("UPDATE users SET status='offline', last_seen=? WHERE username=?", 
                       (datetime.now().isoformat(), username))
             conn.commit()
             conn.close()
-            
-            print(f"❌ {username} отключился. Онлайн: {len(self.active_connections)}")
+            print(f"❌ {username} офлайн")
     
-    async def send_personal(self, message: dict, username: str):
+    async def send_to_user(self, username: str, message: dict):
         if username in self.active_connections:
             try:
                 await self.active_connections[username].send_json(message)
-            except Exception as e:
-                print(f"Ошибка отправки {username}: {e}")
+            except:
+                pass
     
-    async def broadcast_user_list(self):
+    async def broadcast_users(self):
         conn = sqlite3.connect('messenger.db')
         c = conn.cursor()
         c.execute("SELECT username, status, avatar, bio FROM users")
-        users = [{"username": row[0], "status": row[1], "avatar": row[2] or "", "bio": row[3] or ""} for row in c.fetchall()]
+        users = [{"username": r[0], "status": r[1], "avatar": r[2] or "", "bio": r[3] or ""} for r in c.fetchall()]
         conn.close()
         
-        message = {"type": "user_list", "users": users}
-        for username, ws in self.active_connections.items():
+        for ws in self.active_connections.values():
             try:
-                await ws.send_json(message)
+                await ws.send_json({"type": "users", "users": users})
             except:
                 pass
     
@@ -147,17 +142,17 @@ class ConnectionManager:
         conn = sqlite3.connect('messenger.db')
         c = conn.cursor()
         c.execute("SELECT username FROM group_members WHERE group_id=?", (group_id,))
-        members = [row[0] for row in c.fetchall()]
+        members = [r[0] for r in c.fetchall()]
         conn.close()
         
         for member in members:
             if member != exclude and member in self.active_connections:
-                await self.send_personal(message, member)
+                await self.send_to_user(member, message)
 
 manager = ConnectionManager()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def save_private_message(from_user, to_user, message):
+# Функции для БД
+def save_private(from_user, to_user, message):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     c.execute("INSERT INTO messages (from_user, to_user, message, timestamp) VALUES (?, ?, ?, ?)",
@@ -165,7 +160,7 @@ def save_private_message(from_user, to_user, message):
     conn.commit()
     conn.close()
 
-def save_group_message(group_id, from_user, message):
+def save_group(group_id, from_user, message):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     c.execute("INSERT INTO group_messages (group_id, from_user, message, timestamp) VALUES (?, ?, ?, ?)",
@@ -173,135 +168,97 @@ def save_group_message(group_id, from_user, message):
     conn.commit()
     conn.close()
 
-# ========== API ЭНДПОИНТЫ ==========
+# API Эндпоинты
 @app.get("/")
 async def root():
     return FileResponse("index.html")
 
 @app.get("/health")
 async def health():
-    return {"status": "alive", "timestamp": datetime.now().isoformat()}
-
-class AuthData(BaseModel):
-    username: str
-    password: str
+    conn = sqlite3.connect('messenger.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    conn.close()
+    return {"status": "ok", "users": users, "online": len(manager.active_connections)}
 
 @app.post("/register")
-async def register(data: AuthData):
-    hashed = hashlib.sha256(data.password.encode()).hexdigest()
+async def register(username: str, password: str):
+    hashed = hashlib.sha256(password.encode()).hexdigest()
     try:
         conn = sqlite3.connect('messenger.db')
         c = conn.cursor()
         c.execute("INSERT INTO users (username, password, created_at, status) VALUES (?, ?, ?, ?)",
-                  (data.username, hashed, datetime.now().isoformat(), "offline"))
+                  (username, hashed, datetime.now().isoformat(), "offline"))
         conn.commit()
         conn.close()
         return {"success": True}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Username exists")
+    except:
+        raise HTTPException(400, "Пользователь уже существует")
 
 @app.post("/login")
-async def login(data: AuthData):
-    hashed = hashlib.sha256(data.password.encode()).hexdigest()
+async def login(username: str, password: str):
+    hashed = hashlib.sha256(password.encode()).hexdigest()
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
-    c.execute("SELECT username, avatar, bio, phone, email FROM users WHERE username=? AND password=?", 
-              (data.username, hashed))
+    c.execute("SELECT username, avatar, bio FROM users WHERE username=? AND password=?", (username, hashed))
     user = c.fetchone()
     conn.close()
-    
     if user:
-        return {
-            "success": True,
-            "username": user[0],
-            "avatar": user[1] or "",
-            "bio": user[2] or "",
-            "phone": user[3] or "",
-            "email": user[4] or ""
-        }
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+        return {"success": True, "username": user[0], "avatar": user[1] or "", "bio": user[2] or ""}
+    raise HTTPException(401, "Неверные данные")
 
 @app.get("/profile/{username}")
 async def get_profile(username: str):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
-    c.execute("SELECT username, avatar, bio, status, last_seen, phone, email, created_at FROM users WHERE username=?", (username,))
+    c.execute("SELECT username, avatar, bio, status, last_seen FROM users WHERE username=?", (username,))
     user = c.fetchone()
     conn.close()
-    
     if user:
-        return {
-            "username": user[0],
-            "avatar": user[1] or "",
-            "bio": user[2] or "",
-            "status": user[3] or "offline",
-            "last_seen": user[4],
-            "phone": user[5] or "",
-            "email": user[6] or "",
-            "joined": user[7]
-        }
-    raise HTTPException(status_code=404, detail="User not found")
+        return {"username": user[0], "avatar": user[1] or "", "bio": user[2] or "", "status": user[3] or "offline", "last_seen": user[4]}
+    raise HTTPException(404, "Не найден")
 
 @app.post("/update_profile")
 async def update_profile(
     username: str = Form(...),
     bio: str = Form(None),
-    phone: str = Form(None),
-    email: str = Form(None),
     avatar: UploadFile = File(None)
 ):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     
-    updates = []
-    params = []
-    
     if bio is not None:
-        updates.append("bio=?")
-        params.append(bio)
-    if phone is not None:
-        updates.append("phone=?")
-        params.append(phone)
-    if email is not None:
-        updates.append("email=?")
-        params.append(email)
+        c.execute("UPDATE users SET bio=? WHERE username=?", (bio, username))
+    
     if avatar:
-        avatar_data = await avatar.read()
-        avatar_base64 = base64.b64encode(avatar_data).decode('utf-8')
-        avatar_save = f"data:{avatar.content_type};base64,{avatar_base64}"
-        updates.append("avatar=?")
-        params.append(avatar_save)
+        data = await avatar.read()
+        b64 = base64.b64encode(data).decode()
+        avatar_data = f"data:{avatar.content_type};base64,{b64}"
+        c.execute("UPDATE users SET avatar=? WHERE username=?", (avatar_data, username))
     
-    if updates:
-        params.append(username)
-        c.execute(f"UPDATE users SET {', '.join(updates)} WHERE username=?", params)
-        conn.commit()
-    
+    conn.commit()
     conn.close()
     return {"success": True}
 
-@app.get("/history/private/{user1}/{user2}")
-async def private_history(user1: str, user2: str):
+@app.get("/history/{user1}/{user2}")
+async def get_history(user1: str, user2: str):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
-    c.execute("""SELECT from_user, message, timestamp 
-                 FROM messages 
+    c.execute("""SELECT from_user, message, timestamp FROM messages 
                  WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)
-                 ORDER BY timestamp LIMIT 200""", 
-              (user1, user2, user2, user1))
-    messages = [{"from": row[0], "text": row[1], "time": row[2]} for row in c.fetchall()]
+                 ORDER BY timestamp LIMIT 200""", (user1, user2, user2, user1))
+    msgs = [{"from": r[0], "text": r[1], "time": r[2]} for r in c.fetchall()]
     conn.close()
-    return messages
+    return msgs
 
-@app.get("/group/list/{username}")
-async def list_groups(username: str):
+@app.get("/groups/{username}")
+async def get_groups(username: str):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
-    c.execute("""SELECT g.id, g.name, g.description, g.avatar 
-                 FROM groups g 
-                 JOIN group_members gm ON g.id = gm.group_id 
-                 WHERE gm.username=?""", (username,))
-    groups = [{"id": row[0], "name": row[1], "description": row[2] or "", "avatar": row[3] or ""} for row in c.fetchall()]
+    c.execute("""SELECT g.id, g.name, g.description FROM groups g 
+                 JOIN group_members gm ON g.id=gm.group_id WHERE gm.username=?""", (username,))
+    groups = [{"id": r[0], "name": r[1], "description": r[2] or ""} for r in c.fetchall()]
     conn.close()
     return groups
 
@@ -318,8 +275,8 @@ async def create_group(name: str, description: str, created_by: str):
     conn.close()
     return {"success": True, "group_id": group_id}
 
-@app.post("/group/add_member")
-async def add_member(group_id: int, username: str, added_by: str):
+@app.post("/group/add")
+async def add_to_group(group_id: int, username: str):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     try:
@@ -328,58 +285,55 @@ async def add_member(group_id: int, username: str, added_by: str):
         conn.commit()
         conn.close()
         return {"success": True}
-    except sqlite3.IntegrityError:
+    except:
         conn.close()
-        raise HTTPException(status_code=400, detail="User already in group")
+        raise HTTPException(400, "Уже в группе")
 
-@app.get("/history/group/{group_id}")
+@app.get("/group/history/{group_id}")
 async def group_history(group_id: int):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
-    c.execute("""SELECT from_user, message, timestamp 
-                 FROM group_messages 
-                 WHERE group_id=?
-                 ORDER BY timestamp LIMIT 200""", (group_id,))
-    messages = [{"from": row[0], "text": row[1], "time": row[2]} for row in c.fetchall()]
+    c.execute("SELECT from_user, message, timestamp FROM group_messages WHERE group_id=? ORDER BY timestamp LIMIT 200", (group_id,))
+    msgs = [{"from": r[0], "text": r[1], "time": r[2]} for r in c.fetchall()]
     conn.close()
-    return messages
+    return msgs
 
-@app.get("/user/search/{query}")
+@app.get("/search/{query}")
 async def search_users(query: str):
     conn = sqlite3.connect('messenger.db')
     c = conn.cursor()
     c.execute("SELECT username FROM users WHERE username LIKE ? LIMIT 10", (f"%{query}%",))
-    users = [row[0] for row in c.fetchall()]
+    users = [r[0] for r in c.fetchall()]
     conn.close()
     return users
 
-# ========== WEBSOCKET (ГЛАВНОЕ) ==========
+# WebSocket
 @app.websocket("/ws/{username}")
-async def websocket_endpoint(websocket: WebSocket, username: str):
+async def websocket_handler(websocket: WebSocket, username: str):
     await manager.connect(websocket, username)
     try:
         while True:
             data = await websocket.receive_json()
-            print(f"📨 Получено от {username}: {data}")
+            print(f"📨 {username}: {data}")
             
             if data["type"] == "private":
-                save_private_message(username, data["to"], data["message"])
-                await manager.send_personal({
+                save_private(username, data["to"], data["message"])
+                await manager.send_to_user(data["to"], {
                     "type": "private",
                     "from": username,
                     "message": data["message"],
                     "time": datetime.now().strftime("%H:%M")
-                }, data["to"])
-                await manager.send_personal({
+                })
+                await manager.send_to_user(username, {
                     "type": "private",
                     "from": username,
                     "message": data["message"],
                     "time": datetime.now().strftime("%H:%M"),
                     "is_own": True
-                }, username)
+                })
             
             elif data["type"] == "group":
-                save_group_message(data["group_id"], username, data["message"])
+                save_group(data["group_id"], username, data["message"])
                 await manager.send_to_group(data["group_id"], {
                     "type": "group",
                     "group_id": data["group_id"],
@@ -387,24 +341,23 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     "message": data["message"],
                     "time": datetime.now().strftime("%H:%M")
                 }, exclude=username)
-                await manager.send_personal({
+                await manager.send_to_user(username, {
                     "type": "group",
                     "group_id": data["group_id"],
                     "from": username,
                     "message": data["message"],
                     "time": datetime.now().strftime("%H:%M"),
                     "is_own": True
-                }, username)
+                })
                 
     except WebSocketDisconnect:
         manager.disconnect(username)
-        await manager.broadcast_user_list()
 
 if __name__ == "__main__":
-    print("=" * 50)
+    print("\n" + "="*50)
     print("🚀 МАКС МЕССЕНДЖЕР ЗАПУЩЕН")
-    print("=" * 50)
-    print("📊 Health check: /health")
-    print("👤 Тестовый пользователь: testuser / test123")
-    print("=" * 50)
+    print("="*50)
+    print("👤 Логин: testuser")
+    print("🔑 Пароль: test123")
+    print("="*50 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000)
